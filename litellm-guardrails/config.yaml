@@ -1,0 +1,132 @@
+# LiteLLM Proxy Configuration with LLM Guard Custom Guardrail
+# 
+# This configuration integrates LiteLLM Proxy with a self-hosted LLM Guard API
+# for comprehensive input and output content scanning.
+#
+# Documentation:
+# - LiteLLM Custom Guardrails: https://docs.litellm.ai/docs/proxy/guardrails/custom_guardrail
+# - LLM Guard API: https://protectai.github.io/llm-guard/api/overview/
+
+# =============================================================================
+# MODEL CONFIGURATION
+# =============================================================================
+model_list:
+  - model_name: gpt-4
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: os.environ/OPENAI_API_KEY
+
+  - model_name: gpt-4-turbo
+    litellm_params:
+      model: openai/gpt-4-turbo
+      api_key: os.environ/OPENAI_API_KEY
+
+  - model_name: gpt-3.5-turbo
+    litellm_params:
+      model: openai/gpt-3.5-turbo
+      api_key: os.environ/OPENAI_API_KEY
+
+  # Add more models as needed
+  # - model_name: claude-3
+  #   litellm_params:
+  #     model: anthropic/claude-3-opus-20240229
+  #     api_key: os.environ/ANTHROPIC_API_KEY
+
+# =============================================================================
+# GUARDRAIL CONFIGURATION
+# =============================================================================
+guardrails:
+  # ---------------------------------------------------------------------------
+  # PRE-CALL GUARDRAIL (Separate File: llm_guard_pre_call.py)
+  # ---------------------------------------------------------------------------
+  # Runs BEFORE the LLM API call
+  # Can MODIFY input (sanitize prompts) and BLOCK requests
+  # Uses: async_pre_call_hook
+  - guardrail_name: "llm-guard-pre-call"
+    litellm_params:
+      guardrail: llm_guard_pre_call.LLMGuardPreCallGuardrail
+      mode: "pre_call"
+      api_base: os.environ/LLM_GUARD_API_BASE  # e.g., http://localhost:8000
+      api_key: os.environ/LLM_GUARD_API_KEY    # Optional
+      risk_threshold: 0.5                       # Block if score > threshold
+      timeout: 10                               # Request timeout in seconds
+      fail_on_error: true                       # Block on API errors
+      sanitize_prompt: true                     # Replace with sanitized prompt
+      default_on: true
+      # scanners_suppress:                      # Optional: Suppress specific scanners
+      #   - "Toxicity"
+      #   - "BanTopics"
+
+  # ---------------------------------------------------------------------------
+  # DURING-CALL GUARDRAIL (Separate File: llm_guard_during_call.py)
+  # ---------------------------------------------------------------------------
+  # Runs IN PARALLEL with LLM API call (lower latency)
+  # CANNOT modify input, only ACCEPT or REJECT
+  # Uses: async_moderation_hook
+  - guardrail_name: "llm-guard-during-call"
+    litellm_params:
+      guardrail: llm_guard_during_call.LLMGuardDuringCallGuardrail
+      mode: "during_call"
+      api_base: os.environ/LLM_GUARD_API_BASE
+      api_key: os.environ/LLM_GUARD_API_KEY
+      risk_threshold: 0.5
+      timeout: 10
+      fail_on_error: true
+      use_scan_endpoint: true                   # Use /scan/prompt (faster) vs /analyze/prompt
+      default_on: true
+  # ---------------------------------------------------------------------------
+  # POST-CALL GUARDRAIL (Separate File: llm_guard_post_call.py)
+  # ---------------------------------------------------------------------------
+  # Runs AFTER the LLM API call completes
+  # Scans output and can BLOCK responses
+  # Uses: async_post_call_success_hook (non-streaming)
+  #       async_post_call_streaming_iterator_hook (streaming)
+  - guardrail_name: "llm-guard-post-call"
+    litellm_params:
+      guardrail: llm_guard_post_call.LLMGuardPostCallGuardrail
+      mode: "post_call"
+      api_base: os.environ/LLM_GUARD_API_BASE
+      api_key: os.environ/LLM_GUARD_API_KEY
+      risk_threshold: 0.5
+      timeout: 30                               # Longer timeout for output scanning
+      fail_on_error: true
+      stream_scan_interval: 100                 # Characters between stream scans
+      scan_partial_stream: true                 # Scan during streaming
+      default_on: true
+  # ---------------------------------------------------------------------------
+  # COMBINED GUARDRAIL (Original File: llm_guard_guardrail.py)
+  # ---------------------------------------------------------------------------
+  # All-in-one guardrail with all hooks implemented
+  # Use if you want a single file for all modes
+  - guardrail_name: "llm-guard-combined"
+    litellm_params:
+      guardrail: llm_guard_guardrail.LLMGuardGuardrail
+      mode: "pre_call"  # Can be: pre_call, during_call, or post_call
+      api_base: os.environ/LLM_GUARD_API_BASE
+      api_key: os.environ/LLM_GUARD_API_KEY
+      risk_threshold: 0.5
+      timeout: 10
+      fail_on_error: true
+# =============================================================================
+# LITELLM GENERAL SETTINGS
+# =============================================================================
+litellm_settings:
+  # Enable detailed logging for debugging
+  set_verbose: true
+  
+  # Cache settings (optional)
+  # cache: true
+  # cache_params:
+  #   type: redis
+  #   host: localhost
+  #   port: 6379
+
+# =============================================================================
+# GENERAL SETTINGS
+# =============================================================================
+general_settings:
+  # Master key for admin access
+  master_key: os.environ/LITELLM_MASTER_KEY
+  
+  # Database URL for persistent storage (optional)
+  # database_url: os.environ/DATABASE_URL
