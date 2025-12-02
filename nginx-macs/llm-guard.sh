@@ -38,8 +38,8 @@ AUTH_TOKEN="${LLM_GUARD_AUTH_TOKEN:-}"
 # Python executable (use virtual environment if available)
 PYTHON="${LLM_GUARD_PYTHON:-python3}"
 
-# Use gunicorn instead of uvicorn (recommended for production)
-USE_GUNICORN="${LLM_GUARD_USE_GUNICORN:-false}"
+# Use uvicorn with workers instead of gunicorn (recommended for production)
+USE_UVICORN_WORKERS="${LLM_GUARD_USE_UVICORN_WORKERS:-false}"
 
 # PID file location
 PID_FILE="${LLM_GUARD_PID_FILE:-/var/run/${SERVICE_NAME}.pid}"
@@ -91,17 +91,23 @@ log_debug() {
 # Get the PID of the running service
 get_pid() {
     if [ -f "$PID_FILE" ]; then
-        cat "$PID_FILE"
-    else
-        # Try to find by process name
-        pgrep -f "llm_guard_api\|uvicorn.*app.app\|gunicorn.*app.app" | head -1
+        local pid=$(cat "$PID_FILE")
+        # Verify PID is valid and process exists
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            echo "$pid"
+            return 0
+        fi
+    fi
+    # Fallback: Try to find by process name (for Linux with pgrep)
+    if command -v pgrep &> /dev/null; then
+        pgrep -f "llm_guard_api|uvicorn.*app.app|gunicorn.*app.app" | head -1
     fi
 }
 
 # Check if the service is running
 is_running() {
     local pid=$(get_pid)
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    if [ -n "$pid" ]; then
         return 0
     else
         return 1
@@ -228,14 +234,14 @@ start_service() {
     
     # Build the command
     local cmd=""
-    if [ "$USE_GUNICORN" = "true" ]; then
-        # Use gunicorn with uvicorn worker
-        cmd="gunicorn --workers ${WORKERS} --preload --worker-class uvicorn.workers.UvicornWorker --bind ${HOST}:${PORT} 'app.app:create_app(config_file=\"${CONFIG_FILE}\")'"
-        log_info "Using gunicorn with ${WORKERS} worker(s)"
+    if [ "$USE_UVICORN_WORKERS" = "true" ]; then
+        # Use uvicorn with workers (production mode)
+        cmd="uvicorn app.app:create_app --host=${HOST} --port=${PORT} --workers=${WORKERS} --forwarded-allow-ips='*' --proxy-headers --timeout-keep-alive=2"
+        log_info "Using uvicorn with ${WORKERS} worker(s) (production mode)"
     else
-        # Use uvicorn directly (or llm_guard_api CLI)
+        # Use llm_guard_api CLI (simple mode)
         cmd="llm_guard_api ${CONFIG_FILE} --host ${HOST} --port ${PORT}"
-        log_info "Using uvicorn (llm_guard_api CLI)"
+        log_info "Using llm_guard_api CLI (simple mode)"
     fi
     
     # Start the service with nohup
@@ -259,39 +265,30 @@ start_service() {
     export LOG_LEVEL="${LOG_LEVEL}"
     [ -n "$AUTH_TOKEN" ] && export AUTH_TOKEN="${AUTH_TOKEN}"
     
-    # Start with log rotation wrapper
+    # Start the service with nohup and log rotation
+    # We use a simpler approach: redirect output to a log file directly
     nohup bash -c "
-        while true; do
-            # Check and rotate log if date changed
+        exec $cmd 2>&1 | while IFS= read -r line; do
             NEW_DATE=\$(date +\"%Y%m%d\")
             CURRENT_LOG=\"${LOG_DIR}/logs_\${NEW_DATE}.log\"
-            
-            # Run the command and append to current date's log
-            $cmd 2>&1 | while IFS= read -r line; do
-                NEW_DATE=\$(date +\"%Y%m%d\")
-                CURRENT_LOG=\"${LOG_DIR}/logs_\${NEW_DATE}.log\"
-                TIMESTAMP=\$(date +\"%Y-%m-%d %H:%M:%S\")
-                echo \"[\${TIMESTAMP}] \${line}\" >> \"\${CURRENT_LOG}\"
-                # Update symlink
-                ln -sf \"\${CURRENT_LOG}\" \"${LOG_FILE_CURRENT}\" 2>/dev/null
-            done
-            
-            # If command exits, log it and break
-            echo \"[\$(date +\"%Y-%m-%d %H:%M:%S\")] [ERROR] Process exited unexpectedly\" >> \"\${CURRENT_LOG}\"
-            break
+            TIMESTAMP=\$(date +\"%Y-%m-%d %H:%M:%S\")
+            echo \"[\${TIMESTAMP}] \${line}\" >> \"\${CURRENT_LOG}\"
+            # Update symlink
+            ln -sf \"\${CURRENT_LOG}\" \"${LOG_FILE_CURRENT}\" 2>/dev/null
         done
     " &
-    local pid=$!
+    local wrapper_pid=$!
     
-    # Save PID
-    echo $pid > "$PID_FILE"
+    # Save wrapper PID
+    echo $wrapper_pid > "$PID_FILE"
     
-    # Wait a moment and check if it started
-    sleep 2
+    # Wait for the service to start
+    sleep 3
     
-    if is_running; then
-        write_log "INFO" "Service started successfully (PID: $pid)"
-        log_info "${SERVICE_NAME} started successfully (PID: $pid)"
+    # Check if the wrapper process is still running
+    if kill -0 "$wrapper_pid" 2>/dev/null; then
+        write_log "INFO" "Service started successfully (PID: $wrapper_pid)"
+        log_info "${SERVICE_NAME} started successfully (PID: $wrapper_pid)"
         log_info "API available at: http://${HOST}:${PORT}"
         log_info "Health check: http://${HOST}:${PORT}/healthz"
         log_info "Current log: $LOG_FILE_CURRENT"
@@ -566,7 +563,7 @@ show_usage() {
     echo "  LLM_GUARD_WORKERS          - Number of workers (default: 1)"
     echo "  LLM_GUARD_LOG_LEVEL        - Log level (default: INFO)"
     echo "  LLM_GUARD_AUTH_TOKEN       - Authentication token (optional)"
-    echo "  LLM_GUARD_USE_GUNICORN     - Use gunicorn instead of uvicorn (default: false)"
+    echo "  LLM_GUARD_USE_UVICORN_WORKERS - Use uvicorn with multiple workers (default: false)"
     echo "  LLM_GUARD_PYTHON           - Python executable (default: python3)"
     echo "  LLM_GUARD_PID_FILE         - PID file location"
     echo "  LLM_GUARD_LOG_DIR          - Log directory (default: /var/log/llm-guard-api)"
@@ -583,7 +580,7 @@ show_usage() {
     echo "  $0 cleanup-logs            # Cleanup old logs"
     echo ""
     echo "  # With custom settings"
-    echo "  LLM_GUARD_PORT=9000 LLM_GUARD_USE_GUNICORN=true $0 start"
+    echo "  LLM_GUARD_PORT=9000 LLM_GUARD_USE_UVICORN_WORKERS=true $0 start"
     echo "  LLM_GUARD_LOG_RETENTION_DAYS=7 $0 start  # Keep only 7 days of logs"
     echo ""
 }
