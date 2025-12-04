@@ -147,14 +147,10 @@ class LLMGuardPreCallGuardrail(CustomGuardrail):
         scanners = result.get("scanners", {})
         
         if not is_valid:
-            triggered_scanners = [
-                f"{scanner}({score:.2f})" 
-                for scanner, score in scanners.items() 
-                if score > self.risk_threshold
-            ]
+            
             raise ValueError(
                 f"[PreCall] Input blocked by LLM Guard. "
-                f"Triggered: {', '.join(triggered_scanners)}"
+                f"Triggered: {repr(scanners)}"
             )
         
         for scanner, score in scanners.items():
@@ -203,24 +199,13 @@ class LLMGuardPreCallGuardrail(CustomGuardrail):
         try:
             result = await self._scan_prompt(prompt_text)
             
-            verbose_proxy_logger.info(
+            verbose_proxy_logger.debug(
                 f"[PreCall] Scan result: is_valid={result.get('is_valid')}, "
                 f"scanners={result.get('scanners')}"
             )
             
             # Check if content should be blocked
             self._check_scan_result(result)
-            
-            # Optionally update with sanitized prompt
-            if self.sanitize_prompt:
-                sanitized_prompt = result.get("sanitized_prompt")
-                if sanitized_prompt and sanitized_prompt != prompt_text:
-                    verbose_proxy_logger.info("[PreCall] Prompt sanitized by LLM Guard")
-                    messages = data.get("messages", [])
-                    for message in reversed(messages):
-                        if message.get("role") == "user":
-                            message["content"] = sanitized_prompt
-                            break
             
             return data
             

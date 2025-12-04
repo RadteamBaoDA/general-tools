@@ -16,6 +16,7 @@ LiteLLM Custom Guardrail: https://docs.litellm.ai/docs/proxy/guardrails/custom_g
 """
 
 import os
+import asyncio
 from typing import Any, AsyncGenerator, Dict, List, Optional
 
 import litellm
@@ -27,6 +28,7 @@ from litellm.llms.custom_httpx.http_handler import (
 )
 from litellm.proxy._types import UserAPIKeyAuth
 from litellm.types.utils import ModelResponseStream
+from litellm.proxy.proxy_server import StreamingCallbackError
 
 
 class LLMGuardPostCallGuardrail(CustomGuardrail):
@@ -171,14 +173,9 @@ class LLMGuardPostCallGuardrail(CustomGuardrail):
         ctx = f"[PostCall{context}]"
         
         if not is_valid:
-            triggered_scanners = [
-                f"{scanner}({score:.2f})" 
-                for scanner, score in scanners.items() 
-                if score > self.risk_threshold
-            ]
             raise ValueError(
                 f"{ctx} Output blocked by LLM Guard. "
-                f"Triggered: {', '.join(triggered_scanners)}"
+                f"Triggered: {repr(scanners)}"
             )
         
         for scanner, score in scanners.items():
@@ -188,61 +185,20 @@ class LLMGuardPostCallGuardrail(CustomGuardrail):
                     f"Score: {score:.2f} (threshold: {self.risk_threshold})"
                 )
 
-    async def async_post_call_success_hook(
-        self,
-        data: dict,
-        user_api_key_dict: UserAPIKeyAuth,
-        response,
-    ):
+
+    async def _read_stream_to_queue(
+        self, response: Any, queue: asyncio.Queue
+    ) -> None:
         """
-        Post-call success hook: Scan output for non-streaming responses.
-        
-        This method runs after the LLM call completes successfully.
-        It scans the complete response and can reject it.
-        
-        Note: This hook is called when stream=False
-        
-        Args:
-            data: Original request data
-            user_api_key_dict: User API key information
-            response: LLM response object
+        Producer task: Read chunks from response stream and put into queue.
         """
-        verbose_proxy_logger.debug(
-            "[PostCall] async_post_call_success_hook triggered"
-        )
-        
-        # Extract original prompt
-        prompt_text = self._extract_messages_text(data)
-        
-        # Extract output from response
-        output_text = self._extract_response_text(response)
-        
-        if not output_text.strip():
-            verbose_proxy_logger.debug("[PostCall] No output content to scan")
-            return
-        
         try:
-            result = await self._scan_output(prompt_text, output_text)
-            
-            verbose_proxy_logger.info(
-                f"[PostCall] Scan result: is_valid={result.get('is_valid')}, "
-                f"scanners={result.get('scanners')}"
-            )
-            
-            # Check if content should be blocked
-            self._check_scan_result(result)
-            
-        except ValueError:
-            # Re-raise validation errors (blocked content)
-            raise
+            async for chunk in response:
+                await queue.put(chunk)
         except Exception as e:
-            verbose_proxy_logger.error(f"[PostCall] LLM Guard API error: {str(e)}")
-            if self.fail_on_error:
-                raise ValueError(f"[PostCall] LLM Guard API error: {str(e)}")
-            else:
-                verbose_proxy_logger.warning(
-                    "[PostCall] Allowing response despite API error"
-                )
+            verbose_proxy_logger.error(f"[PostCall-Stream] Error reading stream: {str(e)}")
+        finally:
+            await queue.put(None)  # Sentinel for end of stream
 
     async def async_post_call_streaming_iterator_hook(
         self,
@@ -275,64 +231,117 @@ class LLMGuardPostCallGuardrail(CustomGuardrail):
         # Extract original prompt
         prompt_text = self._extract_messages_text(request_data)
         
-        # Accumulate stream content for scanning
+        # Buffer for chunks and accumulated text
+        chunk_buffer: List[ModelResponseStream] = []
         accumulated_output = ""
         last_scan_length = 0
         
-        async for chunk in response:
-            # Extract text from chunk
-            if isinstance(chunk, ModelResponseStream):
-                for choice in chunk.choices:
-                    if hasattr(choice, "delta") and choice.delta:
-                        if hasattr(choice.delta, "content") and choice.delta.content:
-                            accumulated_output += choice.delta.content
-            
-            # Periodically scan accumulated content (if enabled)
-            if self.scan_partial_stream:
-                if len(accumulated_output) - last_scan_length >= self.stream_scan_interval:
-                    try:
-                        result = await self._scan_output(prompt_text, accumulated_output)
-                        
-                        verbose_proxy_logger.debug(
-                            f"[PostCall-Stream] Partial scan: is_valid={result.get('is_valid')}, "
-                            f"length={len(accumulated_output)}"
-                        )
-                        
-                        self._check_scan_result(result, "-Stream")
-                        last_scan_length = len(accumulated_output)
-                        
-                    except ValueError:
-                        raise
-                    except Exception as e:
-                        verbose_proxy_logger.error(
-                            f"[PostCall-Stream] Partial scan error: {str(e)}"
-                        )
-                        if self.fail_on_error:
-                            raise ValueError(
-                                f"[PostCall-Stream] LLM Guard API error: {str(e)}"
-                            )
-            
-            yield chunk
+        # Create queue and start producer task
+        queue = asyncio.Queue()
+        producer_task = asyncio.create_task(self._read_stream_to_queue(response, queue))
         
-        # Final scan of complete output
-        if accumulated_output and len(accumulated_output) > last_scan_length:
-            try:
-                result = await self._scan_output(prompt_text, accumulated_output)
+        try:
+            while True:
+                # Get chunk from queue
+                chunk = await queue.get()
                 
-                verbose_proxy_logger.info(
-                    f"[PostCall-Stream] Final scan: is_valid={result.get('is_valid')}, "
-                    f"scanners={result.get('scanners')}"
-                )
+                if chunk is None:  # End of stream
+                    break
                 
-                self._check_scan_result(result, "-StreamFinal")
+                # Buffer the chunk
+                chunk_buffer.append(chunk)
                 
-            except ValueError:
-                raise
-            except Exception as e:
-                verbose_proxy_logger.error(
-                    f"[PostCall-Stream] Final scan error: {str(e)}"
-                )
-                if self.fail_on_error:
-                    raise ValueError(
-                        f"[PostCall-Stream] LLM Guard API error: {str(e)}"
+                # Extract text from chunk
+                if isinstance(chunk, ModelResponseStream):
+                    for choice in chunk.choices:
+                        if hasattr(choice, "delta") and choice.delta:
+                            if hasattr(choice.delta, "content") and choice.delta.content:
+                                accumulated_output += choice.delta.content
+                
+                # Periodically scan accumulated content (if enabled)
+                if self.scan_partial_stream:
+                    if len(accumulated_output) - last_scan_length >= self.stream_scan_interval:
+                        try:
+                            result = await self._scan_output(prompt_text, accumulated_output)
+                            
+                            verbose_proxy_logger.debug(
+                                f"[PostCall-Stream] Partial scan: is_valid={result.get('is_valid')}, "
+                                f"length={len(accumulated_output)}"
+                            )
+                            
+                            self._check_scan_result(result, "-Stream")
+                            
+                            # If valid, yield all buffered chunks
+                            for buffered_chunk in chunk_buffer:
+                                yield buffered_chunk
+                            chunk_buffer = [] # Clear buffer
+                            
+                            last_scan_length = len(accumulated_output)
+                            
+                        except ValueError as e:
+                            # Block the stream
+                            raise StreamingCallbackError(
+                                message=str(e),
+                                llm_provider="llm_guard"
+                            )
+                        except Exception as e:
+                            verbose_proxy_logger.error(
+                                f"[PostCall-Stream] Partial scan error: {str(e)}"
+                            )
+                            if self.fail_on_error:
+                                raise StreamingCallbackError(
+                                    message=f"[PostCall-Stream] LLM Guard API error: {str(e)}",
+                                    llm_provider="llm_guard"
+                                )
+                            else:
+                                # If we allow on error, yield buffered chunks
+                                for buffered_chunk in chunk_buffer:
+                                    yield buffered_chunk
+                                chunk_buffer = []
+                else:
+                     # If partial scan is disabled, just yield immediately (no buffering)
+                     yield chunk
+                     chunk_buffer = [] # Ensure buffer stays empty
+            
+            # Final scan of complete output
+            if accumulated_output and len(accumulated_output) > last_scan_length:
+                try:
+                    result = await self._scan_output(prompt_text, accumulated_output)
+                    
+                    verbose_proxy_logger.info(
+                        f"[PostCall-Stream] Final scan: is_valid={result.get('is_valid')}, "
+                        f"scanners={result.get('scanners')}"
                     )
+                    
+                    self._check_scan_result(result, "-StreamFinal")
+                    
+                    # Yield any remaining buffered chunks
+                    for buffered_chunk in chunk_buffer:
+                        yield buffered_chunk
+                    
+                except ValueError as e:
+                    raise StreamingCallbackError(
+                        message=str(e),
+                        llm_provider="llm_guard"
+                    )
+                except Exception as e:
+                    verbose_proxy_logger.error(
+                        f"[PostCall-Stream] Final scan error: {str(e)}"
+                    )
+                    if self.fail_on_error:
+                        raise StreamingCallbackError(
+                            message=f"[PostCall-Stream] LLM Guard API error: {str(e)}",
+                            llm_provider="llm_guard"
+                        )
+                    else:
+                        for buffered_chunk in chunk_buffer:
+                            yield buffered_chunk
+                            
+        finally:
+            # Ensure producer task is cancelled if we exit early
+            if not producer_task.done():
+                producer_task.cancel()
+                try:
+                    await producer_task
+                except asyncio.CancelledError:
+                    pass
